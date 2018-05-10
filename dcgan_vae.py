@@ -12,6 +12,7 @@ import torchvision.datasets as dset
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
 from torch.autograd import Variable
+from torch.nn import functional as F
 
 
 parser = argparse.ArgumentParser()
@@ -23,7 +24,8 @@ parser.add_argument('--imageSize', type=int, default=64, help='the height / widt
 parser.add_argument('--nz', type=int, default=100, help='size of the latent z vector')
 parser.add_argument('--ngf', type=int, default=64)
 parser.add_argument('--ndf', type=int, default=64)
-parser.add_argument('--niter', type=int, default=25, help='number of epochs to train for')
+parser.add_argument('--niter', type=int, default=10, help='number of epochs to train for')
+parser.add_argument('--vae_epochs', type=int, default=3, help='number of epochs to train for')
 parser.add_argument('--lr', type=float, default=0.0002, help='learning rate, default=0.0002')
 parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam. default=0.5')
 parser.add_argument('--cuda', action='store_true', help='enables cuda')
@@ -32,8 +34,6 @@ parser.add_argument('--netG', default='', help="path to netG (to continue traini
 parser.add_argument('--netD', default='', help="path to netD (to continue training)")
 parser.add_argument('--outf', default='.', help='folder to output images and model checkpoints')
 parser.add_argument('--manualSeed', type=int, help='manual seed')
-
-parser.add_argument('--giter', type=int, default=1, help='number of times to train G per D')
 
 opt = parser.parse_args()
 print(opt)
@@ -78,7 +78,7 @@ elif opt.dataset == 'cifar10':
                            transform=transforms.Compose([
                                transforms.Resize(opt.imageSize),
                                transforms.ToTensor(),
-                               transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                               
                            ]))
 elif opt.dataset == 'fake':
     dataset = dset.FakeData(image_size=(3, opt.imageSize, opt.imageSize),
@@ -127,7 +127,8 @@ class _netG(nn.Module):
             nn.ReLU(True),
             # state size. (ngf) x 32 x 32
             nn.ConvTranspose2d(    ngf,      nc, 4, 2, 1, bias=False),
-            nn.Tanh()
+            #nn.Tanh()
+            nn.Sigmoid()
             # state size. (nc) x 64 x 64
         )
 
@@ -146,8 +147,6 @@ if opt.netG != '':
 print(netG)
 
 
-#Try stride 1
-# 3x3 filter
 class _netD(nn.Module):
     def __init__(self, ngpu):
         super(_netD, self).__init__()
@@ -171,7 +170,6 @@ class _netD(nn.Module):
             # state size. (ndf*8) x 4 x 4
             nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
                                   
-                                  #Should we add any fully connected layers here for better discrimination?
             nn.Sigmoid()
         )
 
@@ -189,6 +187,106 @@ netD.apply(weights_init)
 if opt.netD != '':
     netD.load_state_dict(torch.load(opt.netD))
 print(netD)
+
+
+class _VAE(nn.Module):
+    def __init__(self):
+        super(_VAE, self).__init__()
+        #self.ngpu = ngpu
+        
+        # for image 3x64x64
+        self.fc1 = nn.Linear(12288, 6000)
+        self.fc21 = nn.Linear(6000, 100)
+        self.fc22 = nn.Linear(6000, 100)
+        self.fc3 = nn.Linear(100, 6000)
+        self.fc4 = nn.Linear(6000, 12288)
+    
+    #for image 3x32x32
+    #        self.fc1 = nn.Linear(3072, 1000)
+    #        self.fc21 = nn.Linear(1000, 100)
+    #        self.fc22 = nn.Linear(1000, 100)
+    #        self.fc3 = nn.Linear(100, 1000)
+    #        self.fc4 = nn.Linear(1000, 3072)
+    
+    def encode(self, x):
+        h1 = F.relu(self.fc1(x))
+        return self.fc21(h1), self.fc22(h1)
+    
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5*logvar)
+        #eps = torch.randn_like(std)
+        eps = Variable(torch.randn(std.size()))
+        if opt.cuda:
+            eps = eps.cuda()
+        return eps.mul(std).add_(mu)
+    
+    #        if self.training:
+    #            std = torch.exp(0.5*logvar)
+    #            #eps = torch.randn_like(std)
+    #            eps = Variable(torch.randn(std.size()))
+    #            if opt.cuda:
+    #                eps = eps.cuda()
+    #            return eps.mul(std).add_(mu)
+    #        else:
+    #            return mu
+    
+    def decode(self, z):
+        h3 = F.relu(self.fc3(z))
+        return F.sigmoid(self.fc4(h3))
+    #return F.tanh(self.fc4(h3))
+    
+    def forward(self, x):
+        mu, logvar = self.encode(x.view(-1, 12288))
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+
+
+# Reconstruction + KL divergence losses summed over all elements and batch
+def loss_function(recon_x, x, mu, logvar):
+    BCE = F.binary_cross_entropy(recon_x, x.view(-1, 12288), size_average=False)
+    #BCE = criterion(recon_x, x.view(-1, 12288))
+    #BCE = criterion(Variable(recon_x.data.resize_(opt.batchSize, 3, opt.imageSize, opt.imageSize)), x)
+    
+    # see Appendix B from VAE paper:
+    # Kingma and Welling. Auto-Encoding Variational Bayes. ICLR, 2014
+    # https://arxiv.org/abs/1312.6114
+    # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    
+    return BCE + KLD
+
+
+VAE = _VAE()
+optimizer = optim.Adam(VAE.parameters(), lr=1e-3)
+input_vae = torch.FloatTensor(opt.batchSize, 3, opt.imageSize, opt.imageSize)
+
+if opt.cuda:
+    VAE.cuda()
+    input_vae = input_vae.cuda()
+
+for epoch in range(1, opt.vae_epochs + 1):
+    for i, data in enumerate(dataloader, 0):
+
+        VAE.zero_grad()
+        real_cpu, _ = data
+        batch_size = real_cpu.size(0)
+        if opt.cuda:
+            real_cpu = real_cpu.cuda()
+        input_vae.resize_as_(real_cpu).copy_(real_cpu)
+        #input_vae = input/255 # divide by 255 so pixels are in [0,1] range like ouput of autoencoder
+        input_vae_v = Variable(input_vae)
+
+        recon_batch, mu, logvar = VAE(input_vae_v)
+        loss = loss_function(recon_batch, input_vae_v, mu, logvar)
+        loss.backward()
+        optimizer.step()
+
+        print('[%d/%d][%d/%d] Loss: %.4f'
+              % (epoch, opt.vae_epochs, i, len(dataloader),
+                 loss.data[0]/(len(data)*12288) ))
+
+
 
 criterion = nn.BCELoss() #nn.BCEWithLogitsLoss more numerically stable
 
@@ -215,6 +313,7 @@ optimizerG = optim.Adam(netG.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
 import numpy as np
 probabilities=[]
 loss=[]
+
 for epoch in range(opt.niter):
     for i, data in enumerate(dataloader, 0):
         ############################
@@ -238,8 +337,16 @@ for epoch in range(opt.niter):
         D_x = output.data.mean()
 
         # train with fake
-        noise.resize_(batch_size, nz, 1, 1).normal_(0, 1)
-        noisev = Variable(noise)
+#        noise.resize_(batch_size, nz, 1, 1).normal_(0, 1)
+#        noisev = Variable(noise)
+        mu, logvar = VAE.encode(Variable(inputv.data.view(-1, 12288)))
+        mu.data.resize_(batch_size, nz, 1, 1)
+        std = torch.exp(0.5*logvar)
+        std.data.resize_(batch_size, nz, 1, 1)
+        samples = torch.normal(mu.data, std.data)
+        #noise.resize_(batch_size, nz, 1, 1).normal_(mu.data, std.data)
+        noisev = Variable(samples)
+    
         fake = netG(noisev)
         labelv = Variable(label.fill_(fake_label))
         output = netD(fake.detach())
@@ -252,62 +359,45 @@ for epoch in range(opt.niter):
         ############################
         # (2) Update G network: maximize log(D(G(z)))
         ###########################
-        for iter in range(opt.giter):
-            netG.zero_grad()
-            labelv = Variable(label.fill_(real_label))  # fake labels are real for generator cost
-            output = netD(fake)
-            errG = criterion(output, labelv)
-            errG.backward()
-            D_G_z2 = output.data.mean()
-            optimizerG.step()
-   #G train a variable number of times for each iteration of D whenever D(G(z)) fell below a certain threshold to try to speed up training 
-   #and make G more stable. 
-            if iter < opt.giter - 1 and D_G_z1 < 0.2:
-                print('Inside g-iter')
-                noise.resize_(batch_size, nz, 1, 1).normal_(0, 1)
-                noisev = Variable(noise)
-                fake = netG(noisev)
-            else:
-                break
-            print('outside')
-        probabilities.append([D_G_z1,D_G_z2])
-        loss.append([errD.data[0],errG.data[0]])
+        netG.zero_grad()
+        labelv = Variable(label.fill_(real_label))  # fake labels are real for generator cost
+        output = netD(fake)
+        errG = criterion(output, labelv)
+        errG.backward()
+        D_G_z2 = output.data.mean()
+        optimizerG.step()
 
         print('[%d/%d][%d/%d] Loss_D: %.4f Loss_G: %.4f D(x): %.4f D(G(z)): %.4f / %.4f'
               % (epoch, opt.niter, i, len(dataloader),
                  errD.data[0], errG.data[0], D_x, D_G_z1, D_G_z2))
         if i % 100 == 0:
             vutils.save_image(real_cpu,
-                    '%s/real_samples%d.png' % (opt.outf,epoch),
+                    '%s/real_samples.png' % opt.outf,
                     normalize=True)
-            fake = netG(fixed_noise)
+                    #fake = netG(fixed_noise)
             vutils.save_image(fake.data,
                     '%s/fake_samples_epoch_%03d.png' % (opt.outf, epoch),
                     normalize=True)
+            
+        probabilities.append([D_G_z1,D_G_z2])
+        loss.append([errD.data[0],errG.data[0]])
     
-    #Save images as arrays
+     #Save images as arrays
     mydata= (fake.data).cpu().numpy()
     #print(mydata.shape)
     #(16, 3, 64, 64)
     mydata=np.array([mydata[i].flatten() for i in range(mydata.shape[0])])
-    np.savetxt('%s/fake_images%d_nG%d.csv' % (opt.outf, epoch,opt.giter),mydata,delimiter=",")
+    np.savetxt('%s/fake_images%d_vae.csv' % (opt.outf, epoch),mydata,delimiter=",")
 
     #Real images 
     mydata=(real_cpu).cpu().numpy()
     mydata=np.array([mydata[i].flatten() for i in range(mydata.shape[0])])
-    np.savetxt('%s/real_images%d_nG%d.csv' % (opt.outf, epoch,opt.giter),mydata,delimiter=",")
+    np.savetxt('%s/real_images%d_vae.csv' % (opt.outf,epoch),mydata,delimiter=",")
 
     # do checkpointing
     torch.save(netG.state_dict(), '%s/netG_epoch_%d.pth' % (opt.outf, epoch))
     torch.save(netD.state_dict(), '%s/netD_epoch_%d.pth' % (opt.outf, epoch))
 
-#print(real_cpu.size())
-#Save probabilities and images
-
-
-np.savetxt('%s/probs_nG%d.csv' % (opt.outf, opt.giter), probabilities, delimiter=",", fmt='%s')
-np.savetxt('%s/loss_nG%d.csv' % (opt.outf, opt.giter), loss, delimiter=",", fmt='%s')
-
-
-
-
+#Save loss and probabilities
+np.savetxt('%s/probs_vae.csv' % (opt.outf), probabilities, delimiter=",", fmt='%s')
+np.savetxt('%s/loss_vae.csv' % (opt.outf), loss, delimiter=",", fmt='%s')
