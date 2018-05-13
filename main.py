@@ -379,17 +379,7 @@ mydata=np.array([mydata[i].flatten() for i in range(mydata.shape[0])])
 np.savetxt('%s/real_images%d_vae%d.csv' % (opt.outf, epoch,opt.pretrain_epochs),mydata,delimiter=",")
 
     
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
+
     
     
     
