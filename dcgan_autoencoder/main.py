@@ -33,7 +33,7 @@ parser.add_argument('--netD', default='', help="path to netD (to continue traini
 parser.add_argument('--outf', default='.', help='folder to output images and model checkpoints')
 parser.add_argument('--manualSeed', type=int, help='manual seed')
 
-parser.add_argument('--pretrain_epochs', type=int, default=2, help='number of epochs to pre-train for')
+parser.add_argument('--pretrain_epochs', type=int, default=5, help='number of epochs to pre-train for')
 
 opt = parser.parse_args()
 print(opt)
@@ -74,18 +74,38 @@ elif opt.dataset == 'lsun':
                             
                         ]))
 elif opt.dataset == 'cifar10':
-    dataset = dset.CIFAR10(root=opt.dataroot, download=True,
+    trainSet = dset.CIFAR10(root=opt.dataroot, train=True, download=True,
                            transform=transforms.Compose([
                                transforms.Resize(opt.imageSize),
                                transforms.ToTensor(),
                                
                            ]))
+    pretrainSet = dset.CIFAR10(root=opt.dataroot, train=False, download=True,
+                           transform=transforms.Compose([
+                                                         transforms.Resize(opt.imageSize),
+                                                         transforms.ToTensor(),
+                                                         
+                                                         ]))
+
 elif opt.dataset == 'fake':
     dataset = dset.FakeData(image_size=(3, opt.imageSize, opt.imageSize),
                             transform=transforms.ToTensor())
-assert dataset
-dataloader = torch.utils.data.DataLoader(dataset, batch_size=opt.batchSize,
+assert trainSet
+assert pretrainSet
+
+#split dataset into 3 parts
+pretrainloader = torch.utils.data.DataLoader(pretrainSet, batch_size=opt.batchSize,
                                          shuffle=True, num_workers=int(opt.workers))
+
+DSet = [trainSet[i] for i in range(25000)]
+GSet = [trainSet[i] for i in range(25000,50000)]
+Dloader = torch.utils.data.DataLoader(DSet, batch_size=opt.batchSize,
+                                         shuffle=True, num_workers=int(opt.workers))
+Gloader = torch.utils.data.DataLoader(GSet, batch_size=opt.batchSize,
+                                         shuffle=True, num_workers=int(opt.workers))
+
+#dataloader = torch.utils.data.DataLoader(dataset, batch_size=opt.batchSize,
+#                                      shuffle=True, num_workers=int(opt.workers))
 
 ngpu = int(opt.ngpu)
 nz = int(opt.nz)
@@ -258,7 +278,7 @@ if opt.cuda:
 optimizerAE = optim.Adam(AutoEncoder.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
 
 for epoch in range(opt.pretrain_epochs):
-    for i, data in enumerate(dataloader, 0):
+    for i, data in enumerate(pretrainloader, 0):
         ############################
         # (1) Update AutoEncoder network: minimize -(X_in * T.log(X_hat) + (1 - X_in) * T.log(1 - X_hat))
         ###########################
@@ -281,7 +301,8 @@ for epoch in range(opt.pretrain_epochs):
 
 criterion = nn.BCELoss() #nn.BCEWithLogitsLoss more numerically stable
 
-input = torch.FloatTensor(opt.batchSize, 3, opt.imageSize, opt.imageSize)
+inputD = torch.FloatTensor(opt.batchSize, 3, opt.imageSize, opt.imageSize)
+inputG = torch.FloatTensor(opt.batchSize, 3, opt.imageSize, opt.imageSize)
 noise = torch.FloatTensor(opt.batchSize, nz, 1, 1)
 fixed_noise = torch.FloatTensor(opt.batchSize, nz, 1, 1).normal_(0, 1)
 label = torch.FloatTensor(opt.batchSize)
@@ -292,7 +313,7 @@ if opt.cuda:
     netD.cuda()
     netG.cuda()
     criterion.cuda()
-    input, label = input.cuda(), label.cuda()
+    inputD, inputG, label = inputD.cuda(), inputG.cuda(), label.cuda()
     noise, fixed_noise = noise.cuda(), fixed_noise.cuda()
 
 fixed_noise = Variable(fixed_noise)
@@ -313,7 +334,8 @@ D_G_list = []
 G_losses = []
 
 for epoch in range(opt.niter):
-    for i, data in enumerate(dataloader, 0):
+    #for i, data in enumerate(dataloader, 0):
+    for (i, data_d), (j, data_g) in zip(enumerate(Dloader, 0), enumerate(Gloader, 0)):
         ############################
         # (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
         ###########################
@@ -321,16 +343,21 @@ for epoch in range(opt.niter):
        # train with real
         if not skipD:
             netD.zero_grad()
-            real_cpu, _ = data
-            batch_size = real_cpu.size(0)
+            real_cpu_d, _ = data_d
+            real_cpu_g, _ = data_g
+            batch_size_d = real_cpu_d.size(0)
+            batch_size_g = real_cpu_g.size(0)
             if opt.cuda:
-                real_cpu = real_cpu.cuda()
-            input.resize_as_(real_cpu).copy_(real_cpu)
-            label.resize_(batch_size).fill_(real_label)
-            inputv = Variable(input)
+                real_cpu_d = real_cpu_d.cuda()
+                real_cpu_g = real_cpu_g.cuda()
+            inputD.resize_as_(real_cpu_d).copy_(real_cpu_d)
+            inputG.resize_as_(real_cpu_g).copy_(real_cpu_g)
+            label.resize_(batch_size_d).fill_(real_label)
+            inputdv = Variable(inputD)
+            inputgv = Variable(inputG)
             labelv = Variable(label)
 
-            output = netD(inputv)
+            output = netD(inputdv)
             errD_real = criterion(output, labelv)
             errD_real.backward()
             D_x = output.data.mean()
@@ -338,9 +365,11 @@ for epoch in range(opt.niter):
             # train with fake
     #        noise.resize_(batch_size, nz, 1, 1).normal_(0, 1)
     #        noisev = Variable(noise)
-            ae_input = AutoEncoder.input_to_hidden(inputv) #trained autoencoder to take data in [0,1]
+            ae_input = AutoEncoder.input_to_hidden(inputgv) #trained autoencoder to take data in [0,1]
             fake = netG(ae_input)
-            labelv = Variable(label.fill_(fake_label))
+            #labelv = Variable(label.fill_(fake_label))
+            label.resize_(batch_size_g).fill_(fake_label)
+            labelv = Variable(label)
             output = netD(fake.detach())
             errD_fake = criterion(output, labelv)
             errD_fake.backward()
@@ -363,14 +392,14 @@ for epoch in range(opt.niter):
         
         if not skipG:
             if skipD:
-                real_cpu, _ = data
-                batch_size = real_cpu.size(0)
+                real_cpu_g, _ = data_g
+                batch_size_g = real_cpu_g.size(0)
                 if opt.cuda:
-                    real_cpu = real_cpu.cuda()
-                input.resize_as_(real_cpu).copy_(real_cpu)
-                inputv = Variable(input)
-                label.resize_(batch_size).fill_(real_label)
-                ae_input = AutoEncoder.input_to_hidden(inputv) #trained autoencoder to take data in [0,1]
+                    real_cpu_g = real_cpu_g.cuda()
+                inputG.resize_as_(real_cpu_g).copy_(real_cpu_g)
+                inputgv = Variable(inputG)
+                label.resize_(batch_size_g).fill_(real_label)
+                ae_input = AutoEncoder.input_to_hidden(inputgv) #trained autoencoder to take data in [0,1]
                 fake = netG(ae_input)
                 fake = fake.detach()
         
@@ -392,7 +421,7 @@ for epoch in range(opt.niter):
                 countG = 0
 
         print('[%d/%d][%d/%d] Loss_D: %.4f Loss_G: %.4f D(x): %.4f D(G(z)): %.4f / %.4f'
-              % (epoch, opt.niter, i, len(dataloader),
+              % (epoch, opt.niter, i, len(Dloader),
                  errD.data[0], errG.data[0], D_x, D_G_z1, D_G_z2))
 
         if i % 5 == 0:
